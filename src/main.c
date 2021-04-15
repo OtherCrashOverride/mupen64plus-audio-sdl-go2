@@ -32,6 +32,19 @@
 #include "volume.h"
 #include "resamplers/resamplers.h"
 
+#include <go2/audio.h>
+#include <soxr.h>
+
+static go2_audio_t* go2audio;
+static int src_freq;
+static soxr_io_spec_t iospec;
+static soxr_t resampler;
+
+#define GO2_AUDIO_FREQUENCY (44100)
+#define MIX_BUFFER_SIZE (1024 * 16)
+static char mix_buffer[MIX_BUFFER_SIZE];
+static int mix_buffer_frame_count;
+
 #ifdef USE_AUDIORESOURCE
 #include <audioresource.h>
 #include <glib.h>
@@ -247,6 +260,9 @@ EXPORT m64p_error CALL PluginStartup(m64p_dynlib_handle CoreLibHandle, void *Con
     }
 #endif
 
+    go2audio = go2_audio_create(GO2_AUDIO_FREQUENCY);
+
+
     l_PluginInit = 1;
     return M64ERR_SUCCESS;
 }
@@ -264,6 +280,8 @@ EXPORT m64p_error CALL PluginShutdown(void)
     audioresource_release(l_audioresource);
     audioresource_free(l_audioresource);
 #endif
+
+    go2_audio_destroy(go2audio);
 
     l_PluginInit = 0;
     return M64ERR_SUCCESS;
@@ -313,23 +331,69 @@ static unsigned int dacrate2freq(unsigned int vi_clock, uint32_t dacrate)
 
 EXPORT void CALL AiDacrateChanged(int SystemType)
 {
-    if (!l_PluginInit || l_sdl_backend == NULL)
+    if (!l_PluginInit)
         return;
 
     unsigned int frequency = dacrate2freq(vi_clock_from_system_type(SystemType), *AudioInfo.AI_DACRATE_REG);
     unsigned int bits = 1 + (*AudioInfo.AI_BITRATE_REG);
 
-    sdl_set_format(l_sdl_backend, frequency, bits);
+    //sdl_set_format(l_sdl_backend, frequency, bits);
+    src_freq = frequency;
+
+    iospec = soxr_io_spec(SOXR_INT16_I, SOXR_INT16_I);
+
+    if (resampler)
+    {
+        soxr_delete(resampler);
+    }
+
+    resampler = soxr_create(
+        (double)frequency,      /* Input sample-rate. */
+        (double)GO2_AUDIO_FREQUENCY,     /* Output sample-rate. */
+        2,    /* Number of channels to be used. */
+        /* All following arguments are optional (may be set to NULL). */
+        NULL,              /* To report any error during creation. */
+        &iospec,      /* To specify non-default I/O formats. */
+        NULL, /* To specify non-default resampling quality.*/
+        NULL);/* To specify non-default runtime resources. */
 }
 
 EXPORT void CALL AiLenChanged(void)
 {
-    if (!l_PluginInit || l_sdl_backend == NULL)
+    if (!l_PluginInit)
         return;
 
-    sdl_push_samples(l_sdl_backend, AudioInfo.RDRAM + (*AudioInfo.AI_DRAM_ADDR_REG & 0xffffff), *AudioInfo.AI_LEN_REG);
+    //sdl_push_samples(l_sdl_backend, AudioInfo.RDRAM + (*AudioInfo.AI_DRAM_ADDR_REG & 0xffffff), *AudioInfo.AI_LEN_REG);
 
-    sdl_synchronize_audio(l_sdl_backend);
+    //sdl_synchronize_audio(l_sdl_backend);
+
+    void* src = AudioInfo.RDRAM + (*AudioInfo.AI_DRAM_ADDR_REG & 0xffffff);
+    int src_size = *AudioInfo.AI_LEN_REG;
+    int frames = src_size / 4;
+    size_t odone = 0;
+    size_t idone =0;
+
+    soxr_error_t err = soxr_process(
+        resampler,      /* As returned by soxr_create. */
+                                /* Input (to be resampled): */
+        src,             /* Input buffer(s); may be NULL (see below). */
+        frames,           /* Input buf. length (samples per channel). */
+        &idone,        /* To return actual # samples used (<= ilen). */
+                                /* Output (resampled): */
+        mix_buffer + (mix_buffer_frame_count * 4),            /* Output buffer(s).*/
+        (MIX_BUFFER_SIZE - mix_buffer_frame_count) / 4,           /* Output buf. length (samples per channel). */
+        &odone);       /* To return actual # samples out (<= olen). */
+
+    if (!err)
+    {
+        mix_buffer_frame_count += odone;
+
+        if (mix_buffer_frame_count >= (GO2_AUDIO_FREQUENCY / 60))
+        {
+            go2_audio_submit(go2audio, (const short*)mix_buffer, mix_buffer_frame_count);
+            mix_buffer_frame_count = 0;
+        }
+    }    
 }
 
 EXPORT int CALL InitiateAudio(AUDIO_INFO Audio_Info)
@@ -351,7 +415,7 @@ EXPORT int CALL RomOpen(void)
     VolumeControlType = ConfigGetParamInt(l_ConfigAudio, "VOLUME_CONTROL_TYPE");
     VolPercent = ConfigGetParamInt(l_ConfigAudio, "VOLUME_DEFAULT");
 
-    l_sdl_backend = init_sdl_backend_from_config(l_ConfigAudio);
+    //l_sdl_backend = init_sdl_backend_from_config(l_ConfigAudio);
 
     return 1;
 }
@@ -361,7 +425,7 @@ EXPORT void CALL RomClosed(void)
     if (!l_PluginInit)
         return;
 
-    release_sdl_backend(l_sdl_backend);
+    //release_sdl_backend(l_sdl_backend);
     l_sdl_backend = NULL;
 }
 
@@ -374,7 +438,7 @@ EXPORT void CALL SetSpeedFactor(int percentage)
     if (!l_PluginInit || l_sdl_backend == NULL)
         return;
 
-    sdl_set_speed_factor(l_sdl_backend, percentage);
+    //sdl_set_speed_factor(l_sdl_backend, percentage);
 }
 
 size_t ResampleAndMix(void* resampler, const struct resampler_interface* iresampler,
@@ -382,6 +446,7 @@ size_t ResampleAndMix(void* resampler, const struct resampler_interface* iresamp
         const void* src, size_t src_size, unsigned int src_freq,
         void* dst, size_t dst_size, unsigned int dst_freq)
 {
+#if 0
     size_t consumed;
 
 #if defined(HAS_OSS_SUPPORT)
@@ -398,6 +463,9 @@ size_t ResampleAndMix(void* resampler, const struct resampler_interface* iresamp
     }
 
     return consumed;
+#else
+    return 0;
+#endif
 }
 
 void SetPlaybackVolume(void)
